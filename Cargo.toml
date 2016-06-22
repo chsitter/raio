@@ -1,0 +1,9 @@
+[package]
+name = "raio"
+version = "0.1.0"
+authors = ["Christoph Sitter <christoph.sitter@caplin.com>"]
+
+[dependencies]
+log = "0.3.6"
+libc = "0.2.12"
+
