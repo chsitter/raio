@@ -11,11 +11,11 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
 
 pub trait AsyncTcpListener {
-    fn accept_async<F, T: Executor>(&self, event_loop: &T, accept_cb: F) where F: Fn(&mut TcpListener) -> EventControl + Send + 'static;
+    fn accept_async<'a, F, T: Executor>(&self, event_loop: &'a T, accept_cb: F) where F: Fn(&mut TcpListener) -> EventControl + Send + 'a;
 }
 
 pub trait AsyncTcpStream {
-    fn read_async<F, T: Executor>(&self, event_loop: &T, read_cb: F) where F: Fn(&mut TcpStream) -> EventControl + Send + 'static;
+    fn read_async<'a, F, T: Executor>(&self, event_loop: &'a T, read_cb: F) where F: Fn(&mut TcpStream) -> EventControl + Send + 'a;
 }
 
 pub enum EventControl {
@@ -31,6 +31,7 @@ pub trait Executor : Drop {
     fn schedule<T, F: Fn(T) + Send + 'static>(&self, callback: F, context: T, delay: Duration) -> Future;
 
     fn shutdown(&mut self);
+    fn join(&mut self);
     //fn add_accept_event(&self, callback: F);
     //
 
@@ -39,7 +40,7 @@ pub trait Executor : Drop {
 }
 
 impl AsyncTcpListener for TcpListener {
-    fn accept_async<F, T: Executor>(&self, event_loop: &T, accept_cb: F) where F: Fn(&mut TcpListener) -> EventControl + Send + 'static {
+    fn accept_async<'a, F, T: Executor>(&self, event_loop: &'a T, accept_cb: F) where F: Fn(&mut TcpListener) -> EventControl + Send + 'a {
         self.set_nonblocking(true).unwrap();
 
         event_loop.accept(self.try_clone().unwrap(), accept_cb);
@@ -47,7 +48,7 @@ impl AsyncTcpListener for TcpListener {
 }
 
 impl AsyncTcpStream for TcpStream {
-    fn read_async<F, T: Executor>(&self, event_loop: &T, read_cb: F) where F: Fn(&mut TcpStream) -> EventControl + Send + 'static {
+    fn read_async<'a, F, T: Executor>(&self, event_loop: &'a T, read_cb: F) where F: Fn(&mut TcpStream) -> EventControl + Send + 'a {
         self.set_nonblocking(true).unwrap();
 
         event_loop.read(self.try_clone().unwrap(), read_cb);
@@ -69,8 +70,8 @@ enum ThreadMessage {
 }
 
 pub struct SingleThreadedExecutor {
-    join_handle: Option<JoinHandle<()>>,
-    sender: Sender<ThreadMessage>
+    join_handle: Option<JoinHandle<()>>,  //TODO: make RefCell to not need to have mut executors?
+    sender: Mutex<Sender<ThreadMessage>>
 }
 
 impl Executor for SingleThreadedExecutor {
@@ -78,10 +79,10 @@ impl Executor for SingleThreadedExecutor {
 
         let (tx, rx): (Sender<ThreadMessage>, Receiver<ThreadMessage>)= channel();
         SingleThreadedExecutor {
-            sender: tx,
-            join_handle: Some(thread::spawn( move || {
+            sender: Mutex::new(tx),
+            join_handle: Some(thread::Builder::new().name(name.to_string()).spawn( move || {
                 executor_loop(rx);
-            }))
+            }).unwrap())
         }
     }
 
@@ -94,25 +95,30 @@ impl Executor for SingleThreadedExecutor {
     }
 
     fn accept<F: Fn(&mut TcpListener) -> EventControl + Send + 'static>(&self, listener: TcpListener, callback: F) {
-        self.sender.send(ThreadMessage::ADD_ACCEPT_EVENT {
+        let s = self.sender.lock().unwrap();
+        s.send(ThreadMessage::ADD_ACCEPT_EVENT {
             fd: listener.into_raw_fd(),
             callback: Box::new(callback)
         }).unwrap();
     }
 
     fn read<F: Fn(&mut TcpStream) -> EventControl + Send + 'static>(&self, stream: TcpStream, callback: F) {
-        self.sender.send(ThreadMessage::ADD_READ_EVENT {
+        let s = self.sender.lock().unwrap();
+        s.send(ThreadMessage::ADD_READ_EVENT {
             fd: stream.into_raw_fd(),
             callback: Box::new(callback)
         }).unwrap();
     }
 
     fn shutdown(&mut self) {
-        //match self.sender.send(ThreadMessage::SHUTDOWN) {
-            //Ok(()) => {},
-            //Err(e) => println!("Error occurred!!")
-        //}
+        let s = self.sender.lock().unwrap();
+        match s.send(ThreadMessage::SHUTDOWN) {
+            Ok(()) => {},
+            Err(e) => println!("Error occurred!!")
+        }
+    }
 
+    fn join(&mut self) {
         if let Some(x) = self.join_handle.take() {
             x.join();
         }

@@ -1,22 +1,19 @@
-extern crate nio2;
+extern crate raio;
 
 use std::io::prelude::*;
 use std::net::{TcpListener};
-use std::time::Duration;
 use std::thread;
-use nio2::{Executor, SingleThreadedExecutor, AsyncTcpListener, AsyncTcpStream, EventControl};
+use raio::{Executor, SingleThreadedExecutor, AsyncTcpListener, AsyncTcpStream, EventControl};
 
 fn main() {
-    let executor = SingleThreadedExecutor::new("foo");
-    let executor1 = SingleThreadedExecutor::new("foo");
+    let mut executor = SingleThreadedExecutor::new("foo");
     let listener = TcpListener::bind("127.0.0.1:5432").unwrap();
 
-
-    listener.accept_async( &executor, move | list | {
+    listener.accept_async( &executor, | list | {
         println!("Accepting");
         let (stream, addr) = list.accept().unwrap();
 
-        stream.read_async( &executor1, move | s | {
+        stream.read_async( &executor, | s | {
             println!("reading");
             let mut buf = [0; 1024];
 
@@ -40,5 +37,5 @@ fn main() {
         EventControl::KEEP
     });
 
-    thread::sleep(Duration::new(5, 0));
+    executor.join();
 }
