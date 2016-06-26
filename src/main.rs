@@ -2,7 +2,6 @@ extern crate raio;
 
 use std::io::prelude::*;
 use std::net::{TcpListener};
-use std::thread;
 use raio::{Executor, SingleThreadedExecutor, AsyncTcpListener, AsyncTcpStream, EventControl};
 
 fn main() {

@@ -3,11 +3,10 @@ extern crate libc;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::time::Duration;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::thread;
 use std::os::unix::io::IntoRawFd;
-use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
 
 pub trait AsyncTcpListener {
@@ -32,8 +31,6 @@ pub trait Executor : Drop {
 
     fn shutdown(&mut self);
     fn join(&mut self);
-    //fn add_accept_event(&self, callback: F);
-    //
 
     fn accept<F: Fn(&mut TcpListener) -> EventControl + Send>(&self, listener: TcpListener, callback: F);
     fn read<F: Fn(&mut TcpStream) -> EventControl + Send>(&self, stream: TcpStream, callback: F);
@@ -54,16 +51,14 @@ impl AsyncTcpStream for TcpStream {
         event_loop.read(self.try_clone().unwrap(), read_cb);
     }
 }
-//
-//
 
 enum ThreadMessage {
-    SHUTDOWN,
-    ADD_ACCEPT_EVENT {
+    Shutdown,
+    AddAcceptEvent {
         fd: i32,
         callback: Box<Fn(&mut TcpListener) -> EventControl + Send>
     },
-    ADD_READ_EVENT {
+    AddReadEvent {
         fd: i32,
         callback: Box<Fn(&mut TcpStream) -> EventControl + Send>
     }
@@ -96,7 +91,7 @@ impl Executor for SingleThreadedExecutor {
 
     fn accept<F: Fn(&mut TcpListener) -> EventControl + Send + 'static>(&self, listener: TcpListener, callback: F) {
         let s = self.sender.lock().unwrap();
-        s.send(ThreadMessage::ADD_ACCEPT_EVENT {
+        s.send(ThreadMessage::AddAcceptEvent {
             fd: listener.into_raw_fd(),
             callback: Box::new(callback)
         }).unwrap();
@@ -104,7 +99,7 @@ impl Executor for SingleThreadedExecutor {
 
     fn read<F: Fn(&mut TcpStream) -> EventControl + Send + 'static>(&self, stream: TcpStream, callback: F) {
         let s = self.sender.lock().unwrap();
-        s.send(ThreadMessage::ADD_READ_EVENT {
+        s.send(ThreadMessage::AddReadEvent {
             fd: stream.into_raw_fd(),
             callback: Box::new(callback)
         }).unwrap();
@@ -112,15 +107,15 @@ impl Executor for SingleThreadedExecutor {
 
     fn shutdown(&mut self) {
         let s = self.sender.lock().unwrap();
-        match s.send(ThreadMessage::SHUTDOWN) {
+        match s.send(ThreadMessage::Shutdown) {
             Ok(()) => {},
-            Err(e) => println!("Error occurred!!")
+            Err(e) => println!("Error occurred!! {}", e)
         }
     }
 
     fn join(&mut self) {
         if let Some(x) = self.join_handle.take() {
-            x.join();
+            x.join().unwrap();
         }
     }
 }
@@ -137,7 +132,7 @@ enum CallbackType {
 }
 
 fn executor_loop(receiver: Receiver<ThreadMessage>) {
-    let mut nev: libc::c_int = 0;
+    let mut nev;
     let mut readevents: [Option<(CallbackType)>; 10] = [None, None, None, None, None, None, None, None, None, None]; //TODO: this has to be max num of file descriptors big - wasteful but faster
     let mut ev_list: [libc::kevent; 32] = [ libc::kevent { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, udata: std::ptr::null_mut() };32];
     let timeout = Box::into_raw(Box::new(libc::timespec { tv_sec: 0, tv_nsec: 100 })); //Don't want to timeout, should use a pipe to notify that thread about new events
@@ -145,8 +140,8 @@ fn executor_loop(receiver: Receiver<ThreadMessage>) {
 
     loop {
         match receiver.try_recv() { //This should be registered with  kevent too
-            Ok(ThreadMessage::SHUTDOWN)        => break,
-            Ok(ThreadMessage::ADD_ACCEPT_EVENT{ fd, callback }) => {
+            Ok(ThreadMessage::Shutdown)        => break,
+            Ok(ThreadMessage::AddAcceptEvent{ fd, callback }) => {
                 println!("registering accept event for fd {}", fd);
                 readevents[fd as usize] = Some((CallbackType::ACCEPT(callback)));
 
@@ -163,7 +158,7 @@ fn executor_loop(receiver: Receiver<ThreadMessage>) {
                     libc::kevent(kq, &ev_set, 1, std::ptr::null_mut(), 0, std::ptr::null_mut());
                 }
             }
-            Ok(ThreadMessage::ADD_READ_EVENT{ fd, callback }) => {
+            Ok(ThreadMessage::AddReadEvent{ fd, callback }) => {
                 println!("added read event");
                 readevents[fd as usize] = Some((CallbackType::READ(callback)));
 
