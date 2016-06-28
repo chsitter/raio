@@ -29,7 +29,7 @@ pub trait Executor : Drop {
     fn execute<T, F: Fn(T) + Send + 'static>(&self, callback: F, context: T);
     fn schedule<T, F: Fn(T) + Send + 'static>(&self, callback: F, context: T, delay: Duration) -> Future;
 
-    fn shutdown(&mut self);
+    fn shutdown(&self);
     fn join(&mut self);
 
     fn accept<F: Fn(&mut TcpListener) -> EventControl + Send>(&self, listener: TcpListener, callback: F);
@@ -65,7 +65,7 @@ enum ThreadMessage {
 }
 
 pub struct SingleThreadedExecutor {
-    join_handle: Option<JoinHandle<()>>,  //TODO: make RefCell to not need to have mut executors?
+    join_handle: Mutex<Option<JoinHandle<()>>>,  //TODO: make RefCell to not need to have mut executors?
     sender: Mutex<Sender<ThreadMessage>>
 }
 
@@ -75,9 +75,9 @@ impl Executor for SingleThreadedExecutor {
         let (tx, rx): (Sender<ThreadMessage>, Receiver<ThreadMessage>)= channel();
         SingleThreadedExecutor {
             sender: Mutex::new(tx),
-            join_handle: Some(thread::Builder::new().name(name.to_string()).spawn( move || {
+            join_handle: Mutex::new(Some(thread::Builder::new().name(name.to_string()).spawn( move || {
                 executor_loop(rx);
-            }).unwrap())
+            }).unwrap()))
         }
     }
 
@@ -105,7 +105,7 @@ impl Executor for SingleThreadedExecutor {
         }).unwrap();
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&self) {
         let s = self.sender.lock().unwrap();
         match s.send(ThreadMessage::Shutdown) {
             Ok(()) => {},
@@ -114,7 +114,8 @@ impl Executor for SingleThreadedExecutor {
     }
 
     fn join(&mut self) {
-        if let Some(x) = self.join_handle.take() {
+        let mut handle = self.join_handle.lock().unwrap();
+        if let Some(x) = handle.take() {
             x.join().unwrap();
         }
     }
@@ -133,17 +134,28 @@ enum CallbackType {
 
 fn executor_loop(receiver: Receiver<ThreadMessage>) {
     let mut nev;
-    let mut readevents: [Option<(CallbackType)>; 10] = [None, None, None, None, None, None, None, None, None, None]; //TODO: this has to be max num of file descriptors big - wasteful but faster
+
+    let num_fds: usize = unsafe {
+                let mut rlim: libc::rlimit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim as *mut libc::rlimit );
+                rlim.rlim_cur   //TODO: should we be using rlim_max?
+    } as usize;
+
     let mut ev_list: [libc::kevent; 32] = [ libc::kevent { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, udata: std::ptr::null_mut() };32];
     let timeout = Box::into_raw(Box::new(libc::timespec { tv_sec: 0, tv_nsec: 100 })); //Don't want to timeout, should use a pipe to notify that thread about new events
     let kq = unsafe { libc::kqueue() as i32 };
+
+    let mut readevents: Vec<Option<(CallbackType)>> = Vec::with_capacity(num_fds);  //TODO: This should probably be in local storage
+    for i in 0..num_fds {
+        readevents.push(None);
+    }
 
     loop {
         match receiver.try_recv() { //This should be registered with  kevent too
             Ok(ThreadMessage::Shutdown)        => break,
             Ok(ThreadMessage::AddAcceptEvent{ fd, callback }) => {
                 println!("registering accept event for fd {}", fd);
-                readevents[fd as usize] = Some((CallbackType::ACCEPT(callback)));
+                readevents[fd as usize] = Some((CallbackType::ACCEPT(callback))); //TOOD: check whether it's better this way or to move it on to the context of the kevent
 
                 let ev_set = libc::kevent {
                     ident: fd as libc::uintptr_t,
