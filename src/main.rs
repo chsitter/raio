@@ -38,7 +38,7 @@ fn main() {
         EventControl::KEEP
     });
 
-    executor.execute(move || {
+    executor.execute(|| {
         println!("hi0 on thread {:?}", thread::current());
     });
 
