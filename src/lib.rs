@@ -3,7 +3,7 @@ extern crate libc;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::time::Duration;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Condvar};
 use std::thread::JoinHandle;
 use std::thread;
 use std::os::unix::io::IntoRawFd;
@@ -27,7 +27,7 @@ pub struct Future;
 pub trait Executor : Drop {
     fn new(name: &str) -> Self;
     fn execute<F: Fn() + Send + 'static>(&self, callback: F);
-    fn schedule<F: Fn() + Send + 'static>(&self, callback: F, delay: Duration) -> Future;
+    fn schedule<F: Fn() -> EventControl + Send + 'static>(&self, callback: F, delay: Duration) -> Future;
 
     fn shutdown(&self);
     fn join(&mut self);
@@ -61,7 +61,7 @@ enum ThreadMessage {
     },
     Schedule {
         delay: Duration,
-        callback: Box<Fn() + Send>
+        callback: Box<Fn() -> EventControl + Send>
     },
     AddAcceptEvent {
         fd: i32,
@@ -83,20 +83,24 @@ impl Executor for SingleThreadedExecutor {
     fn new(name: &str) -> Self {
 
         let (tx, rx): (Sender<ThreadMessage>, Receiver<ThreadMessage>) = channel();
-        let kq;
-        unsafe {
-             kq = unsafe { libc::kqueue() as i32 };
-        }
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let kq = unsafe { libc::kqueue() as i32 };
 
+        let pair2 = pair.clone();
         let x = SingleThreadedExecutor {
             sender: Mutex::new(tx),
             kqid: kq,
             join_handle: Mutex::new(Some(thread::Builder::new().name(name.to_string()).spawn( move || {
-                executor_loop(kq, rx);
+                executor_loop(kq, rx, &*pair2);
             }).unwrap()))
         };
 
-        thread::sleep(Duration::new(2, 0)); //TODO: use a condvar to wait for everything to be set up
+        let &(ref lock, ref cvar) = &*pair;
+        let mut started = lock.lock().unwrap();
+        while !*started {
+            started = cvar.wait(started).unwrap();
+        }
+
         x
     }
 
@@ -109,7 +113,7 @@ impl Executor for SingleThreadedExecutor {
         self.notify();
     }
 
-    fn schedule<F: Fn() + Send + 'static>(&self, callback: F, delay: Duration) -> Future {
+    fn schedule<F: Fn() -> EventControl + Send + 'static>(&self, callback: F, delay: Duration) -> Future {
         let s = self.sender.lock().unwrap();
         s.send(ThreadMessage::Schedule {
             delay: delay,
@@ -127,7 +131,7 @@ impl Executor for SingleThreadedExecutor {
             fd: listener.into_raw_fd(),
             callback: Box::new(callback)
         }).unwrap();
-        
+
         self.notify();
     }
 
@@ -147,7 +151,7 @@ impl Executor for SingleThreadedExecutor {
             Ok(()) => {},
             Err(e) => println!("Error occurred!! {}", e)
         }
-        
+
         self.notify();
     }
 
@@ -185,7 +189,7 @@ enum CallbackType {
     READ(Box<Fn(&mut TcpStream) -> EventControl>)
 }
 
-fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>) {
+fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>, pair: &(Mutex<bool>, Condvar)) {
     let mut nev;
 
     let num_fds: usize = unsafe {
@@ -193,16 +197,27 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>) {
                 libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim as *mut libc::rlimit );
                 rlim.rlim_cur   //TODO: should we be using rlim_max?
     } as usize;
+    let max_timers:usize = 4096;
+    let mut next_timer:usize = 0;
 
-    let mut readevents: Vec<Option<(CallbackType)>> = Vec::with_capacity(num_fds);  //TODO: This should probably be in local storage
-    for i in 0..num_fds {
+    let mut readevents: Vec<Option<(CallbackType)>> = Vec::with_capacity(num_fds);  //TODO: maybe i should put it on the heap and stick it on to the event context
+    let mut timers: Vec<Option<(Box<Fn() -> EventControl>)>> = Vec::with_capacity(max_timers);  //TODO: maybe i should put it on the heap and stick it on to the event context
+    for _ in 0..num_fds {
         readevents.push(None);
     }
+    for _ in 0..max_timers {
+        timers.push(None);
+    }
 
-    let mut timer: Option<Box<Fn()>> = None;
+    let &(ref lock, ref cvar) = pair;
+    {
+        let mut started = lock.lock().unwrap();
+        *started = true;
+    }
+    cvar.notify_one();
+
 
     let mut ev_list: [libc::kevent; 32] = [ libc::kevent { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, udata: std::ptr::null_mut() };32];
-
 
     let user_ev = libc::kevent {
         ident: 0,
@@ -261,16 +276,19 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>) {
                     callback();
                 },
                 Ok(ThreadMessage::Schedule{ delay, callback }) => {
+                    while let Some(_) = timers[next_timer] {
+                        next_timer = (next_timer + 1) % max_timers;
+                    }
+                    timers[next_timer] = Some(callback);
+
                     let ev_set = libc::kevent {
-                        ident: 0,
+                        ident: next_timer,
                         filter: libc::EVFILT_TIMER,
                         flags: libc::EV_ADD | libc::EV_ENABLE,
                         fflags: 0,
                         data: (delay.as_secs() * 1000 + (delay.subsec_nanos() / 1000000u32) as u64) as isize,
                         udata: std::ptr::null_mut()
                     };
-
-                    timer = Some(callback);
 
                     unsafe {
                         libc::kevent(kq, &ev_set, 1, std::ptr::null_mut(), 0, std::ptr::null_mut());
@@ -293,8 +311,8 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>) {
                 //println!("got {} events", num);
 
                 for i in  0..num {
-                    let fd = ev_list[0].ident as i32;
-                    let filt = ev_list[0].filter as i16;
+                    let fd = ev_list[i as usize].ident as i32;
+                    let filt = ev_list[i as usize].filter as i16;
                     match filt {
                         libc::EVFILT_READ => {
                             if readevents[fd as usize].is_some() {
@@ -353,8 +371,32 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>) {
                             }
                         },
                         libc::EVFILT_TIMER => {
-                            if let Some(ref c) = timer {
-                                c();
+                            let mut deleted = false;
+                            if let Some(ref c) = timers[fd as usize] {
+                                match c() {
+                                    EventControl::DELETE => {
+                                        let ev_set = libc::kevent {
+                                            ident: fd as libc::uintptr_t,
+                                            filter: libc::EVFILT_TIMER,
+                                            flags: libc::EV_DELETE,
+                                            fflags: 0,
+                                            data: 0,
+                                            udata: std::ptr::null_mut()
+                                        };
+
+                                        unsafe {
+                                            libc::kevent(kq, &ev_set, 1, std::ptr::null_mut(), 0, std::ptr::null_mut());
+                                        }
+                                        deleted = true;
+                                    }
+                                    EventControl::KEEP => {
+                                        //noop
+                                    }
+                                }
+                            }
+
+                            if deleted == true {
+                                timers[fd as usize].take();
                             }
                         }
                         libc::EVFILT_USER => {
@@ -367,7 +409,5 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>) {
             }
         }
     }
-
-    println!("Shutting down thread");
 }
 

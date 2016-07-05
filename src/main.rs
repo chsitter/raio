@@ -38,8 +38,7 @@ fn main() {
         EventControl::KEEP
     });
 
-
-    executor.execute(|| {
+    executor.execute(move || {
         println!("hi0 on thread {:?}", thread::current());
     });
 
@@ -53,6 +52,7 @@ fn main() {
 
     executor.schedule( || {
         println!("timer  thread {:?}", thread::current());
+        EventControl::KEEP
     }, Duration::new(2, 0));
 
     executor.join();
