@@ -6,8 +6,10 @@ use std::time::Duration;
 use std::sync::{Arc, Mutex, Condvar};
 use std::thread::JoinHandle;
 use std::thread;
+use std::io::prelude::*;
 use std::os::unix::io::IntoRawFd;
 use std::os::unix::io::FromRawFd;
+use std::collections::VecDeque;
 
 pub trait AsyncTcpListener {
     fn accept_async<'a, F, T: Executor>(&self, event_loop: &'a T, accept_cb: F) where F: Fn(&mut TcpListener) -> EventControl + Send + 'a;
@@ -15,6 +17,7 @@ pub trait AsyncTcpListener {
 
 pub trait AsyncTcpStream {
     fn read_async<'a, F, T: Executor>(&self, event_loop: &'a T, read_cb: F) where F: Fn(&mut TcpStream) -> EventControl + Send + 'a;
+    fn write_async<'a, T: Executor>(&self, event_loop: &'a T, data: Vec<u8>) -> Future;
 }
 
 pub enum EventControl {
@@ -34,6 +37,7 @@ pub trait Executor : Drop {
 
     fn accept<F: Fn(&mut TcpListener) -> EventControl + Send>(&self, listener: TcpListener, callback: F);
     fn read<F: Fn(&mut TcpStream) -> EventControl + Send>(&self, stream: TcpStream, callback: F);
+    fn write(&self, stream: TcpStream, data: Vec<u8>) -> Future;
 
     fn notify(&self);
 }
@@ -51,6 +55,14 @@ impl AsyncTcpStream for TcpStream {
         self.set_nonblocking(true).unwrap();
 
         event_loop.read(self.try_clone().unwrap(), read_cb);
+    }
+
+    fn write_async<'a, T: Executor>(&self, event_loop: &'a T, data: Vec<u8>) -> Future {
+        self.set_nonblocking(true).unwrap();
+
+        event_loop.write(self.try_clone().unwrap(), data);
+
+        Future
     }
 }
 
@@ -70,6 +82,10 @@ enum ThreadMessage {
     AddReadEvent {
         fd: i32,
         callback: Box<Fn(&mut TcpStream) -> EventControl + Send>
+    },
+    AddWriteEvent {
+        fd: i32,
+        payload: Vec<u8>
     }
 }
 
@@ -145,6 +161,15 @@ impl Executor for SingleThreadedExecutor {
         self.notify();
     }
 
+    fn write(&self, stream: TcpStream, data: Vec<u8>) -> Future {
+        let s = self.sender.lock().unwrap();
+        s.send(ThreadMessage::AddWriteEvent {
+            fd: stream.into_raw_fd(),
+            payload: data
+        }).unwrap();
+        Future
+    }
+
     fn shutdown(&self) {
         let s = self.sender.lock().unwrap();
         match s.send(ThreadMessage::Shutdown) {
@@ -201,9 +226,11 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>, pair: &(Mutex<bool>
     let mut next_timer:usize = 0;
 
     let mut readevents: Vec<Option<(CallbackType)>> = Vec::with_capacity(num_fds);  //TODO: maybe i should put it on the heap and stick it on to the event context
+    let mut write_queues: Vec<Option<VecDeque<Vec<u8>>>> = Vec::with_capacity(num_fds);
     let mut timers: Vec<Option<(Box<Fn() -> EventControl>)>> = Vec::with_capacity(max_timers);  //TODO: maybe i should put it on the heap and stick it on to the event context
     for _ in 0..num_fds {
         readevents.push(None);
+        write_queues.push(None);
     }
     for _ in 0..max_timers {
         timers.push(None);
@@ -231,7 +258,6 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>, pair: &(Mutex<bool>
     unsafe {
         libc::kevent(kq, &user_ev, 1, std::ptr::null_mut(), 0, std::ptr::null_mut());
     }
-
 
 
     loop {
@@ -262,6 +288,37 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>, pair: &(Mutex<bool>
                     let ev_set = libc::kevent {
                         ident: fd as libc::uintptr_t,
                         filter: libc::EVFILT_READ,
+                        flags: libc::EV_ADD,
+                        fflags: 0,
+                        data: 0,
+                        udata: std::ptr::null_mut()
+                    };
+
+                    unsafe {
+                        libc::kevent(kq, &ev_set, 1, std::ptr::null_mut(), 0, std::ptr::null_mut());
+                    }
+                },
+                Ok(ThreadMessage::AddWriteEvent{ fd, payload }) => {
+                    println!("added write event to fd {:?}", fd);
+                    let mut found = false;
+
+                    if let Some(_) = write_queues[fd as usize] {
+                       found = true;
+                    }
+
+                    if found == true {
+                        if let Some(ref mut x) = write_queues[fd as usize] {
+                            x.push_back(payload);
+                        }
+                    } else {
+                        let mut tmp = VecDeque::new();
+                        tmp.push_back(payload);
+                        write_queues[fd as usize] = Some(tmp);
+                    }
+
+                    let ev_set = libc::kevent {
+                        ident: fd as libc::uintptr_t,
+                        filter: libc::EVFILT_WRITE,
                         flags: libc::EV_ADD,
                         fflags: 0,
                         data: 0,
@@ -370,10 +427,69 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>, pair: &(Mutex<bool>
                                 }
                             }
                         },
+                        libc::EVFILT_WRITE => {
+                            //TODO: allow for custom write routines to be registered and used
+                            println!("Writing");
+                            if let Some(ref mut queue) = write_queues[fd as usize] {
+                                let mut bucket_written = false;
+                                println!("Writing 1");
+                                if let Some(ref mut data) = queue.front_mut() {
+                                    println!("Writing 2");
+                                    unsafe {
+                                        let mut stream = TcpStream::from_raw_fd(fd);
+                                        if let Ok(bytes_written) = stream.write(data) {
+                                            let data_len = data.len();
+                                            if bytes_written == data_len {
+                                                bucket_written = true;
+                                                println!("Bucket written");
+                                            } else {
+                                                println!("Partial write");
+                                                for i in 0 .. data_len - bytes_written {
+                                                    data.swap(i, bytes_written + i);
+                                                }
+                                                data.truncate(data_len - bytes_written);
+                                            }
+                                        }
+                                        stream.into_raw_fd();
+                                    }
+                                } else {
+                                    let ev_set = libc::kevent {
+                                        ident: fd as libc::uintptr_t,
+                                        filter: libc::EVFILT_WRITE,
+                                        flags: libc::EV_DELETE,
+                                        fflags: 0,
+                                        data: 0,
+                                        udata: std::ptr::null_mut()
+                                    };
+
+                                    unsafe {
+                                        libc::kevent(kq, &ev_set, 1, std::ptr::null_mut(), 0, std::ptr::null_mut());
+                                    }
+                                }
+                                if bucket_written == true {
+                                    println!("popping");
+                                    queue.pop_front();
+                                }
+                            } else {
+                                    println!("Delete write event");
+                                let ev_set = libc::kevent {
+                                    ident: fd as libc::uintptr_t,
+                                    filter: libc::EVFILT_WRITE,
+                                    flags: libc::EV_DELETE,
+                                    fflags: 0,
+                                    data: 0,
+                                    udata: std::ptr::null_mut()
+                                };
+
+                                unsafe {
+                                    libc::kevent(kq, &ev_set, 1, std::ptr::null_mut(), 0, std::ptr::null_mut());
+                                }
+                            }
+                        },
                         libc::EVFILT_TIMER => {
                             let mut deleted = false;
                             if let Some(ref c) = timers[fd as usize] {
-                                match c() {
+                                match (*c)() {
                                     EventControl::DELETE => {
                                         let ev_set = libc::kevent {
                                             ident: fd as libc::uintptr_t,

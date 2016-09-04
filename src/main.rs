@@ -10,6 +10,7 @@ fn main() {
     let mut executor = SingleThreadedExecutor::new("executor-0");
     let listener = TcpListener::bind("127.0.0.1:5432").unwrap();
 
+
     listener.accept_async( &executor, | list | {
         println!("Accepting");
         let (stream, addr) = list.accept().unwrap();
@@ -25,6 +26,17 @@ fn main() {
                 },
                 Ok(r)               => {
                     println!("read {} bytes", r);
+
+                    let mut data:Vec<u8> = Vec::new();
+                    for i in 1..1024 * 1024{
+                        if i%26 == 0 {
+                            data.push('\n' as u8);
+                        }
+                        data.push((65 + i%26) as u8);
+                    }
+                    data.push('\n' as u8);
+
+                    s.write_async( &executor, data);
                     EventControl::KEEP
                 },
                 Err(e) => {
@@ -35,8 +47,10 @@ fn main() {
         });
 
         println!("accepted {:?}", addr);
+
         EventControl::KEEP
     });
+
 
     executor.execute(|| {
         println!("hi0 on thread {:?}", thread::current());
