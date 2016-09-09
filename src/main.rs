@@ -4,13 +4,16 @@ use std::thread;
 use std::time::Duration;
 use std::io::prelude::*;
 use std::net::{TcpListener};
-use raio::{Executor, SingleThreadedExecutor, AsyncTcpListener, AsyncTcpStream, EventControl};
+use std::sync::mpsc::{channel, Sender, Receiver};
+use std::sync::{Arc, Mutex};
+use raio::{Executor, SingleThreadedExecutor, AsyncTcpListener, AsyncTcpStream, EventControl, Future};
 
 fn main() {
     let mut executor = SingleThreadedExecutor::new("executor-0");
     let listener = TcpListener::bind("127.0.0.1:5432").unwrap();
+    let (tx, rx): (Sender<Future>, Receiver<Future>) = channel();
 
-
+    let sender = Mutex::new(tx);
     listener.accept_async( &executor, | list | {
         println!("Accepting");
         let (stream, addr) = list.accept().unwrap();
@@ -36,7 +39,7 @@ fn main() {
                     }
                     data.push('\n' as u8);
 
-                    s.write_async( &executor, data);
+                    sender.lock().unwrap().send(s.write_async( &executor, data));
                     EventControl::KEEP
                 },
                 Err(e) => {
@@ -69,5 +72,11 @@ fn main() {
         EventControl::KEEP
     }, Duration::new(2, 0));
 
+    println!("watiing for future");
+    let future = rx.recv().unwrap();
+    println!("received future");
+    future.get();
+    println!("future get done");
+    
     executor.join();
 }

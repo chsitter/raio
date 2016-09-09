@@ -25,7 +25,42 @@ pub enum EventControl {
     DELETE
 }
 
-pub struct Future;
+pub struct Future {
+    condvar: Arc<((Mutex<bool>, Condvar))>
+}
+
+impl Clone for Future {
+    fn clone(&self) -> Future {
+        Future {
+            condvar: self.condvar.clone()
+        }
+    }
+}
+impl Future {
+
+    pub fn new() -> Future {
+        Future {
+            condvar: Arc::new((Mutex::new(false), Condvar::new()))
+        }
+    }
+
+    pub fn get(self) {
+        let &(ref lock, ref cvar) = &*self.condvar;
+        let mut started = lock.lock().unwrap();
+        while !*started {
+            started = cvar.wait(started).unwrap();
+        }
+
+    }
+
+    pub fn set(&mut self) {
+        let &(ref lock, ref cvar) = &*self.condvar;
+        let mut started = lock.lock().unwrap();
+        *started = true;
+        cvar.notify_one();
+    }
+}
+
 
 pub trait Executor : Drop {
     fn new(name: &str) -> Self;
@@ -60,9 +95,7 @@ impl AsyncTcpStream for TcpStream {
     fn write_async<'a, T: Executor>(&self, event_loop: &'a T, data: Vec<u8>) -> Future {
         self.set_nonblocking(true).unwrap();
 
-        event_loop.write(self.try_clone().unwrap(), data);
-
-        Future
+        event_loop.write(self.try_clone().unwrap(), data)
     }
 }
 
@@ -85,7 +118,8 @@ enum ThreadMessage {
     },
     AddWriteEvent {
         fd: i32,
-        payload: Vec<u8>
+        payload: Vec<u8>,
+        future: Future
     }
 }
 
@@ -137,8 +171,7 @@ impl Executor for SingleThreadedExecutor {
         }).unwrap();
 
         self.notify();
-
-        Future
+        Future::new()
     }
 
     fn accept<F: Fn(&mut TcpListener) -> EventControl + Send + 'static>(&self, listener: TcpListener, callback: F) {
@@ -163,11 +196,15 @@ impl Executor for SingleThreadedExecutor {
 
     fn write(&self, stream: TcpStream, data: Vec<u8>) -> Future {
         let s = self.sender.lock().unwrap();
+        let future = Future::new();
+        let fut1 = future.clone();
         s.send(ThreadMessage::AddWriteEvent {
             fd: stream.into_raw_fd(),
-            payload: data
+            payload: data,
+            future: fut1
         }).unwrap();
-        Future
+
+        future
     }
 
     fn shutdown(&self) {
@@ -226,7 +263,7 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>, pair: &(Mutex<bool>
     let mut next_timer:usize = 0;
 
     let mut readevents: Vec<Option<(CallbackType)>> = Vec::with_capacity(num_fds);  //TODO: maybe i should put it on the heap and stick it on to the event context
-    let mut write_queues: Vec<Option<VecDeque<Vec<u8>>>> = Vec::with_capacity(num_fds);
+    let mut write_queues: Vec<Option<VecDeque<(Vec<u8>, Future)>>> = Vec::with_capacity(num_fds);
     let mut timers: Vec<Option<(Box<Fn() -> EventControl>)>> = Vec::with_capacity(max_timers);  //TODO: maybe i should put it on the heap and stick it on to the event context
     for _ in 0..num_fds {
         readevents.push(None);
@@ -298,7 +335,7 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>, pair: &(Mutex<bool>
                         libc::kevent(kq, &ev_set, 1, std::ptr::null_mut(), 0, std::ptr::null_mut());
                     }
                 },
-                Ok(ThreadMessage::AddWriteEvent{ fd, payload }) => {
+                Ok(ThreadMessage::AddWriteEvent{ fd, payload, future }) => {
                     println!("added write event to fd {:?}", fd);
                     let mut found = false;
 
@@ -308,11 +345,11 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>, pair: &(Mutex<bool>
 
                     if found == true {
                         if let Some(ref mut x) = write_queues[fd as usize] {
-                            x.push_back(payload);
+                            x.push_back((payload, future));
                         }
                     } else {
                         let mut tmp = VecDeque::new();
-                        tmp.push_back(payload);
+                        tmp.push_back((payload, future));
                         write_queues[fd as usize] = Some(tmp);
                     }
 
@@ -433,7 +470,7 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>, pair: &(Mutex<bool>
                             if let Some(ref mut queue) = write_queues[fd as usize] {
                                 let mut bucket_written = false;
                                 println!("Writing 1");
-                                if let Some(ref mut data) = queue.front_mut() {
+                                if let Some(&mut (ref mut data, ref mut future)) = queue.front_mut() {
                                     println!("Writing 2");
                                     unsafe {
                                         let mut stream = TcpStream::from_raw_fd(fd);
@@ -442,6 +479,7 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>, pair: &(Mutex<bool>
                                             if bytes_written == data_len {
                                                 bucket_written = true;
                                                 println!("Bucket written");
+                                                future.set(); 
                                             } else {
                                                 println!("Partial write");
                                                 for i in 0 .. data_len - bytes_written {
