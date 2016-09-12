@@ -6,7 +6,8 @@ use std::io::prelude::*;
 use std::net::{TcpListener};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::sync::{Arc, Mutex};
-use raio::{Executor, SingleThreadedExecutor, AsyncTcpListener, AsyncTcpStream, EventControl, Future};
+use raio::{Executor, SingleThreadedExecutor, AsyncTcpListener, AsyncTcpStream, EventControl};
+use raio::future::Future;
 
 fn main() {
     let mut executor = SingleThreadedExecutor::new("executor-0");

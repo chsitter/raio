@@ -1,4 +1,5 @@
 extern crate libc;
+pub mod future;
 
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Sender, Receiver};
@@ -10,6 +11,7 @@ use std::io::prelude::*;
 use std::os::unix::io::IntoRawFd;
 use std::os::unix::io::FromRawFd;
 use std::collections::VecDeque;
+use future::Future;
 
 pub trait AsyncTcpListener {
     fn accept_async<'a, F, T: Executor>(&self, event_loop: &'a T, accept_cb: F) where F: Fn(&mut TcpListener) -> EventControl + Send + 'a;
@@ -23,42 +25,6 @@ pub trait AsyncTcpStream {
 pub enum EventControl {
     KEEP,
     DELETE
-}
-
-pub struct Future {
-    condvar: Arc<((Mutex<bool>, Condvar))>
-}
-
-impl Clone for Future {
-    fn clone(&self) -> Future {
-        Future {
-            condvar: self.condvar.clone()
-        }
-    }
-}
-impl Future {
-
-    pub fn new() -> Future {
-        Future {
-            condvar: Arc::new((Mutex::new(false), Condvar::new()))
-        }
-    }
-
-    pub fn get(self) {
-        let &(ref lock, ref cvar) = &*self.condvar;
-        let mut started = lock.lock().unwrap();
-        while !*started {
-            started = cvar.wait(started).unwrap();
-        }
-
-    }
-
-    pub fn set(&mut self) {
-        let &(ref lock, ref cvar) = &*self.condvar;
-        let mut started = lock.lock().unwrap();
-        *started = true;
-        cvar.notify_one();
-    }
 }
 
 
@@ -479,7 +445,7 @@ fn executor_loop(kq: i32, receiver: Receiver<ThreadMessage>, pair: &(Mutex<bool>
                                             if bytes_written == data_len {
                                                 bucket_written = true;
                                                 println!("Bucket written");
-                                                future.set(); 
+                                                future.set();
                                             } else {
                                                 println!("Partial write");
                                                 for i in 0 .. data_len - bytes_written {
