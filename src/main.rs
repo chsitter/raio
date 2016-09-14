@@ -14,7 +14,7 @@ fn main() {
     let listener = TcpListener::bind("127.0.0.1:5432").unwrap();
     let (tx, rx): (Sender<Future>, Receiver<Future>) = channel();
 
-    let sender = Mutex::new(tx);
+    //let sender = Mutex::new(tx);
     listener.accept_async( &executor, | list | {
         println!("Accepting");
         let (stream, addr) = list.accept().unwrap();
@@ -40,7 +40,7 @@ fn main() {
                     }
                     data.push('\n' as u8);
 
-                    sender.lock().unwrap().send(s.write_async( &executor, data));
+                    //sender.lock().unwrap().send(s.write_async( &executor, data));
                     EventControl::KEEP
                 },
                 Err(e) => {
@@ -73,11 +73,11 @@ fn main() {
         EventControl::KEEP
     }, Duration::new(2, 0));
 
-    println!("watiing for future");
-    let future = rx.recv().unwrap();
-    println!("received future");
-    future.get();
-    println!("future get done");
+    //println!("watiing for future");
+    //let future = rx.recv().unwrap();
+    //println!("received future");
+    //future.get();
+    //println!("future get done");
     
     executor.join();
 }
