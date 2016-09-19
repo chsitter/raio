@@ -5,7 +5,6 @@ The [`raio`](http://chsitter.github.io/raio/) crate is designed to provide an ea
 
 The aim here is to create an abstraction that allows for different eventloop implementations to be used for different threads, hence the API will probably change a bit. 
 - currently only supports kqueue
-- async write not done yet
 - doesn't yet have a "context" object that could be used as an argument to a fn that gets registered 
 - it's all still a bit hacky and messy
 
@@ -46,6 +45,10 @@ fn main() {
         }
       }
     }
+    
+    //asynchronous write - returns a future that can be waited on
+    let write_done = stream.write_async( &executor, vec![0u8, 1u8, 2u8]);
+    write_done.get()  // call to get() waits until data is written (doesn't have a result yet)
     
     //execute
     executor.execute( || {
