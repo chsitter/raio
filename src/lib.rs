@@ -14,9 +14,11 @@ use std::thread;
 use std::io::prelude::*;
 use std::os::unix::io::IntoRawFd;
 use std::os::unix::io::FromRawFd;
+use std::os::unix::io::AsRawFd;
 use std::collections::VecDeque;
 use future::Future;
 use kqueue::{Kqueue, ReadEventType};
+use std::collections::HashMap;
 
 pub trait AsyncTcpListener {
     fn accept_async<'a, F, T: Executor>(&self, event_loop: &'a T, accept_cb: F) where F: Fn(&mut TcpListener) -> EventControl + Send + 'a;
@@ -109,7 +111,7 @@ impl Executor for SingleThreadedExecutor {
         let mut tmp = Kqueue::new();
         let x = SingleThreadedExecutor {
             sender: Mutex::new(tx),
-            kq: tmp,
+            kq: tmp.clone(),
             join_handle: Mutex::new(Some(thread::Builder::new().name(name.to_string()).spawn( move || {
                 executor_loop(tmp, rx, &*pair2); //Get this to work again
             }).unwrap()))
@@ -211,6 +213,7 @@ enum CallbackType {
 }
 
 fn executor_loop(mut kq: Kqueue, receiver: Receiver<ThreadMessage>, pair: &(Mutex<bool>, Condvar)) {
+    let mut write_queues: Arc<Mutex<HashMap<usize, VecDeque<(Vec<u8>, Future)>>>> = Arc::new(Mutex::new(HashMap::new()));
     let &(ref lock, ref cvar) = pair;
     {
         let mut started = lock.lock().unwrap();
@@ -229,9 +232,61 @@ fn executor_loop(mut kq: Kqueue, receiver: Receiver<ThreadMessage>, pair: &(Mute
                     kq.add_read_event(fd as usize, ReadEventType::READ(callback));
                 },
                 Ok(ThreadMessage::AddWriteEvent{ fd, payload, future }) => {
-                    kq.add_write_event(fd as usize, Box::new(|s| {
-                        EventControl::KEEP
-                    })); //TODO: add real write event
+                    {
+                        let mut locked_write_queues = write_queues.lock().unwrap();
+                        if !locked_write_queues.contains_key(&(fd as usize)) {
+                        locked_write_queues.insert(fd as usize, VecDeque::new()); 
+                        } 
+
+                        if let Some(ref mut queue) = locked_write_queues.get_mut(&(fd as usize)) {
+                            queue.push_back((payload, future));
+                        }
+                    }
+
+                    let mut moved_queues = write_queues.clone();
+                    kq.add_write_event(fd as usize, Box::new(move |s| {
+                        println!("should be writing");
+                        let mut write_queues = moved_queues.lock().unwrap();
+
+                        if let Some(ref mut queue) = write_queues.get_mut(&(fd as usize)) {
+                            let mut bucket_written = false;
+                            println!("Writing 1");
+                            if let Some(&mut (ref mut data, ref mut future)) = queue.front_mut() {
+                                println!("Writing 2");
+                                unsafe {
+                                    let mut stream = TcpStream::from_raw_fd(fd);
+                                    if let Ok(bytes_written) = stream.write(data) {
+                                        let data_len = data.len();
+                                        if bytes_written == data_len {
+                                            bucket_written = true;
+                                            println!("Bucket written");
+                                            future.set();
+                                        } else {
+                                            println!("Partial write");
+                                            for i in 0 .. data_len - bytes_written {
+                                                data.swap(i, bytes_written + i);
+                                            }
+                                            data.truncate(data_len - bytes_written);
+                                        }
+                                    }
+                                    stream.into_raw_fd();
+                                }
+                            } else {
+                                println!("Delete write event as there's nothing left to write");
+                                return EventControl::DELETE
+                            }
+
+                            if bucket_written == true {
+                                println!("popping");
+                                queue.pop_front();
+                            }
+                        } else {
+                            println!("Delete write event");
+                            return EventControl::DELETE
+                        }
+
+                        return EventControl::KEEP
+                    })); 
                 },
                 Ok(ThreadMessage::Execute{ callback }) => {
                     callback();

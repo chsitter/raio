@@ -1,10 +1,12 @@
 use super::{EventControl, libc};
 use super::future::Future;
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::os::unix::io::IntoRawFd;
 use std::os::unix::io::FromRawFd;
 use std::ptr::*;
+use std::sync::atomic::AtomicUsize;
 
 const MAX_TIMERS:usize = 4096;
 
@@ -25,6 +27,18 @@ unsafe impl Sync for Kqueue {
     //Gotta actually make it threadsafe
 }
 
+impl Clone for Kqueue {
+    fn clone(&self) -> Kqueue {
+        Kqueue {
+            kqid: self.kqid,
+            readevents: self.readevents.clone(),
+            writeevents: self.writeevents.clone(),
+            timers: self.timers.clone(),
+            next_timer: self.next_timer
+        }
+    }
+}
+
 impl Kqueue {
 
     pub fn new() -> Kqueue {
@@ -37,15 +51,16 @@ impl Kqueue {
 
         let mut kq = Kqueue {
             kqid : unsafe { libc::kqueue() as i32 },
-            readevents: Vec::with_capacity(num_fds), //TODO: maybe i should put it on the heap and stick it on to the event context
-            writeevents: Vec::with_capacity(num_fds), //TODO: maybe i should put it on the heap and stick it on to the event context
-            timers: Vec::with_capacity(MAX_TIMERS),  //TODO: maybe i should put it on the heap and stick it on to the event context
+            readevents: Arc::new(Mutex::new(Vec::with_capacity(num_fds))), //TODO: maybe i should put it on the heap and stick it on to the event context
+            writeevents: Arc::new(Mutex::new(Vec::with_capacity(num_fds))), //TODO: maybe i should put it on the heap and stick it on to the event context
+            timers: Arc::new(Mutex::new(Vec::with_capacity(MAX_TIMERS))),  //TODO: maybe i should put it on the heap and stick it on to the event context
             next_timer: 0
         };
 
         for _ in 0..num_fds {
-            kq.readevents.push(None);
-            kq.writeevents.push(None);
+            kq.readevents.lock().unwrap().push(None);
+            kq.writeevents.lock().unwrap().push(None);
+            kq.timers.lock().unwrap().push(None);
         }
 
         let user_ev = libc::kevent {
@@ -66,7 +81,7 @@ impl Kqueue {
 
     pub fn add_read_event(&mut self, fd: usize, callback: ReadEventType) {
         println!("registering read event for fd {}", fd);
-        self.readevents[fd as usize] = Some(callback);
+        self.readevents.lock().unwrap()[fd as usize] = Some(callback);
 
         let ev_set = libc::kevent {
             ident: fd as libc::uintptr_t,
@@ -84,7 +99,7 @@ impl Kqueue {
 
 
     pub fn add_write_event(&mut self, fd: usize, callback: Box<Fn(&mut TcpStream) -> EventControl + Send>) {
-        self.writeevents[fd as usize] = Some(callback);
+        self.writeevents.lock().unwrap()[fd as usize] = Some(callback);
         debug!("adding write event to fd {}", fd);
 
         let ev_set = libc::kevent {
@@ -102,10 +117,11 @@ impl Kqueue {
     }
 
     pub fn add_timer(&mut self, callback: Box<Fn() -> EventControl + Send>, delay: Duration) {
-        while let Some(_) = self.timers[self.next_timer] {
-            self.next_timer = (self.next_timer + 1) % MAX_TIMERS;
+        let mut locked_timers = self.timers.lock().unwrap();
+        while let Some(_) = locked_timers[self.next_timer] {
+            self.next_timer = (self.next_timer+ 1) % MAX_TIMERS;
         }
-        self.timers[self.next_timer] = Some(callback);
+        locked_timers[self.next_timer] = Some(callback);
 
         let ev_set = libc::kevent {
             ident: self.next_timer,
@@ -137,7 +153,6 @@ impl Kqueue {
     }
 
     pub fn handle_events(&mut self) {
-        println!("xxx ---> ");
         let mut nev;
         let mut ev_list: [libc::kevent; 32] = [ libc::kevent { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, udata: null_mut() };32];
 
@@ -145,21 +160,21 @@ impl Kqueue {
             nev = libc::kevent(self.kqid, null(), 0, ev_list.as_mut_ptr(), 32, null_mut());
         }
 
-        println!("---> {}", nev);
         match nev {
             -1   => println!("Error occured"),
             0   => {}, //println!("Fired without any events"),
             num => {
-                //println!("got {} events", num);
+                println!("got {} events", num);
 
                 for i in  0..num {
                     let fd = ev_list[i as usize].ident as i32;
                     let filt = ev_list[i as usize].filter as i16;
                     match filt {
                         libc::EVFILT_READ => {
-                            if self.readevents[fd as usize].is_some() {
+                            let mut locked_readevents = self.readevents.lock().unwrap();
+                            if locked_readevents[fd as usize].is_some() {
                                 let mut deleted = false;
-                                if let Some(ref cb_type) = self.readevents[fd as usize] {
+                                if let Some(ref cb_type) = locked_readevents[fd as usize] {
                                     match cb_type {
                                         &ReadEventType::ACCEPT(ref cb)  => unsafe {
                                             println!("accepting from fd {}", fd);
@@ -208,73 +223,47 @@ impl Kqueue {
                                     }
                                 }
                                 if deleted == true {
-                                    self.readevents[fd as usize].take();
+                                    locked_readevents[fd as usize].take();
                                 }
                             }
                         },
                         libc::EVFILT_WRITE => {
                             //TODO: allow for custom write routines to be registered and used
-                            println!("Writing");
-                            //if let Some(ref mut queue) = write_queues[fd as usize] {
-                                //let mut bucket_written = false;
-                                //println!("Writing 1");
-                                //if let Some(&mut (ref mut data, ref mut future)) = queue.front_mut() {
-                                    //println!("Writing 2");
-                                    //unsafe {
-                                        //let mut stream = TcpStream::from_raw_fd(fd);
-                                        //if let Ok(bytes_written) = stream.write(data) {
-                                            //let data_len = data.len();
-                                            //if bytes_written == data_len {
-                                                //bucket_written = true;
-                                                //println!("Bucket written");
-                                                //future.set();
-                                            //} else {
-                                                //println!("Partial write");
-                                                //for i in 0 .. data_len - bytes_written {
-                                                    //data.swap(i, bytes_written + i);
-                                                //}
-                                                //data.truncate(data_len - bytes_written);
-                                            //}
-                                        //}
-                                        //stream.into_raw_fd();
-                                    //}
-                                //} else {
-                                    //let ev_set = libc::kevent {
-                                        //ident: fd as libc::uintptr_t,
-                                        //filter: libc::EVFILT_WRITE,
-                                        //flags: libc::EV_DELETE,
-                                        //fflags: 0,
-                                        //data: 0,
-                                        //udata: null_mut()
-                                    //};
 
-                                    //unsafe {
-                                        //libc::kevent(kq, &ev_set, 1, null_mut(), 0, null_mut());
-                                    //}
-                                //}
-                                //if bucket_written == true {
-                                    //println!("popping");
-                                    //queue.pop_front();
-                                //}
-                            //} else {
-                                //println!("Delete write event");
-                                //let ev_set = libc::kevent {
-                                    //ident: fd as libc::uintptr_t,
-                                    //filter: libc::EVFILT_WRITE,
-                                    //flags: libc::EV_DELETE,
-                                    //fflags: 0,
-                                    //data: 0,
-                                    //udata: null_mut()
-                                //};
+                            let mut locked_writeevents = self.writeevents.lock().unwrap();
+                            if locked_writeevents[fd as usize].is_some() {
+                                let mut deleted = false;
+                                if let Some(ref cb) = locked_writeevents[fd as usize] {
+                                    let mut stream = unsafe { TcpStream::from_raw_fd(fd) };
+                                    match (cb)(&mut stream ) {
+                                        EventControl::DELETE => {
+                                            let ev_set = libc::kevent {
+                                                ident: fd as libc::uintptr_t,
+                                                filter: libc::EVFILT_WRITE,
+                                                flags: libc::EV_DELETE,
+                                                fflags: 0,
+                                                data: 0,
+                                                udata: null_mut()
+                                            };
 
-                                //unsafe {
-                                    //libc::kevent(kq, &ev_set, 1, null_mut(), 0, null_mut());
-                                //}
-                            //}
+                                            unsafe { libc::kevent(self.kqid, &ev_set, 1, null_mut(), 0, null_mut()) };
+                                            deleted = true;
+                                        },
+                                        EventControl::KEEP => {
+                                            stream.into_raw_fd();
+                                        }
+                                    }
+                                }
+
+                                if deleted == true {
+                                    locked_writeevents[fd as usize].take();
+                                }
+                            }
                         },
                         libc::EVFILT_TIMER => {
                             let mut deleted = false;
-                            if let Some(ref c) = self.timers[fd as usize] {
+                            let mut locked_timers = self.timers.lock().unwrap();
+                            if let Some(ref c) = locked_timers[fd as usize] {
                                 match (*c)() {
                                     EventControl::DELETE => {
                                         let ev_set = libc::kevent {
@@ -298,7 +287,7 @@ impl Kqueue {
                             }
 
                             if deleted == true {
-                                self.timers[fd as usize].take();
+                                locked_timers[fd as usize].take();
                             }
                         }
                         libc::EVFILT_USER => {
