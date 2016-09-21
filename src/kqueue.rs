@@ -1,4 +1,4 @@
-use super::{EventControl, libc};
+use super::{EventControl, libc, EventLoop};
 use super::future::Future;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -10,10 +10,6 @@ use std::sync::atomic::AtomicUsize;
 
 const MAX_TIMERS:usize = 4096;
 
-pub enum ReadEventType {
-    ACCEPT(Box<Fn(&mut TcpListener) -> EventControl + Send>),
-    READ(Box<Fn(&mut TcpStream) -> EventControl + Send>)
-}
 
 pub struct Kqueue {
     kqid: i32,
@@ -39,9 +35,9 @@ impl Clone for Kqueue {
     }
 }
 
-impl Kqueue {
+impl EventLoop for Kqueue {
 
-    pub fn new() -> Kqueue {
+    fn new() -> Kqueue {
 
         let num_fds: usize = unsafe {
                     let mut rlim: libc::rlimit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
@@ -79,7 +75,7 @@ impl Kqueue {
         kq
     }
 
-    pub fn add_read_event(&mut self, fd: usize, callback: ReadEventType) {
+    fn add_read_event(&mut self, fd: usize, callback: ReadEventType) {
         println!("registering read event for fd {}", fd);
         self.readevents.lock().unwrap()[fd as usize] = Some(callback);
 
@@ -98,7 +94,7 @@ impl Kqueue {
     }
 
 
-    pub fn add_write_event(&mut self, fd: usize, callback: Box<Fn(&mut TcpStream) -> EventControl + Send>) {
+    fn add_write_event(&mut self, fd: usize, callback: Box<Fn(&mut TcpStream) -> EventControl + Send>) {
         self.writeevents.lock().unwrap()[fd as usize] = Some(callback);
         debug!("adding write event to fd {}", fd);
 
@@ -116,7 +112,7 @@ impl Kqueue {
         }
     }
 
-    pub fn add_timer(&mut self, callback: Box<Fn() -> EventControl + Send>, delay: Duration) {
+    fn add_timer(&mut self, callback: Box<Fn() -> EventControl + Send>, delay: Duration) {
         let mut locked_timers = self.timers.lock().unwrap();
         while let Some(_) = locked_timers[self.next_timer] {
             self.next_timer = (self.next_timer+ 1) % MAX_TIMERS;
@@ -137,7 +133,7 @@ impl Kqueue {
         }
     }
 
-    pub fn notify(&self) {
+    fn notify(&self) {
         let ev = libc::kevent {
             ident: 0,
             filter: libc::EVFILT_USER,
@@ -152,7 +148,7 @@ impl Kqueue {
         }
     }
 
-    pub fn handle_events(&mut self) {
+    fn handle_events(&mut self) {
         let mut nev;
         let mut ev_list: [libc::kevent; 32] = [ libc::kevent { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, udata: null_mut() };32];
 

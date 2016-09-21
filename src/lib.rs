@@ -3,7 +3,12 @@ extern crate libc;
 extern crate log;
 
 pub mod future;
-mod kqueue;
+//mod kqueue;
+//use kqueue::Kqueue;
+
+mod select;
+use select::Select;
+
 
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Sender, Receiver};
@@ -17,8 +22,21 @@ use std::os::unix::io::FromRawFd;
 use std::os::unix::io::AsRawFd;
 use std::collections::VecDeque;
 use future::Future;
-use kqueue::{Kqueue, ReadEventType};
 use std::collections::HashMap;
+
+pub enum ReadEventType {
+    ACCEPT(Box<Fn(&mut TcpListener) -> EventControl + Send>),
+    READ(Box<Fn(&mut TcpStream) -> EventControl + Send>)
+}
+
+trait EventLoop : Sized {
+    fn new() -> Self;
+    fn add_read_event(&mut self, fd: usize, callback: ReadEventType);
+    fn add_write_event(&mut self, fd: usize, callback: Box<Fn(&mut TcpStream) -> EventControl + Send>);
+    fn add_timer(&mut self, callback: Box<Fn() -> EventControl + Send>, delay: Duration);
+    fn notify(&self);
+    fn handle_events(&mut self);
+}
 
 pub trait AsyncTcpListener {
     fn accept_async<'a, F, T: Executor>(&self, event_loop: &'a T, accept_cb: F) where F: Fn(&mut TcpListener) -> EventControl + Send + 'a;
@@ -97,7 +115,7 @@ enum ThreadMessage {
 
 pub struct SingleThreadedExecutor {
     join_handle: Mutex<Option<JoinHandle<()>>>,
-    kq: Kqueue,
+    kq: Select,
     sender: Mutex<Sender<ThreadMessage>>
 }
 
@@ -108,7 +126,9 @@ impl Executor for SingleThreadedExecutor {
         let pair = Arc::new((Mutex::new(false), Condvar::new()));
 
         let pair2 = pair.clone();
-        let mut tmp = Kqueue::new();
+
+        //let mut tmp = Kqueue::new();
+        let mut tmp = Select::new();
         let x = SingleThreadedExecutor {
             sender: Mutex::new(tx),
             kq: tmp.clone(),
@@ -212,7 +232,7 @@ enum CallbackType {
     READ(Box<Fn(&mut TcpStream) -> EventControl>)
 }
 
-fn executor_loop(mut kq: Kqueue, receiver: Receiver<ThreadMessage>, pair: &(Mutex<bool>, Condvar)) {
+fn executor_loop(mut kq: Select, receiver: Receiver<ThreadMessage>, pair: &(Mutex<bool>, Condvar)) {
     let mut write_queues: Arc<Mutex<HashMap<usize, VecDeque<(Vec<u8>, Future)>>>> = Arc::new(Mutex::new(HashMap::new()));
     let &(ref lock, ref cvar) = pair;
     {
